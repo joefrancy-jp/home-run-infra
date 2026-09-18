@@ -1,0 +1,45 @@
+name: UAT on demand
+run-name: UAT ${{ inputs.operation }} | ${{ inputs.cloud }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      cloud:
+        description: Cloud for the isolated UAT environment
+        required: true
+        type: choice
+        options: [aws, gcp, azure]
+      operation:
+        description: Plan, create/update for load testing, or destroy after testing
+        required: true
+        default: plan
+        type: choice
+        options: [plan, create, destroy]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require a protected deployment branch
+        run: '[[ "$GITHUB_REF" =~ ^refs/heads/(main|master)$ ]]'
+  secrets:
+    needs: check
+    uses: ./.github/workflows/trufflehog.yml
+  uat:
+    needs: [check, secrets]
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/terraform-target.yml
+    with:
+      cloud: ${{ inputs.cloud }}
+      environment: uat
+      apply: ${{ inputs.operation != 'plan' }}
+      destroy: ${{ inputs.operation == 'destroy' }}
+      ref: ${{ github.sha }}
+    secrets:
+      ENVIRONMENT_READ_TOKEN: ${{ secrets.ENVIRONMENT_READ_TOKEN }}

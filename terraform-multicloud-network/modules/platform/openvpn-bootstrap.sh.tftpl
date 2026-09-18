@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get -o Acquire::Retries=5 update
+apt-get -o Acquire::Retries=5 install -y openvpn easy-rsa dnsmasq iptables-persistent
+umask 077
+install -d -m 700 /etc/openvpn/easy-rsa /root/vpn-clients
+cp -a /usr/share/easy-rsa/. /etc/openvpn/easy-rsa/
+cd /etc/openvpn/easy-rsa
+export EASYRSA_BATCH=1 EASYRSA_ALGO=ec EASYRSA_CURVE=prime256v1
+if [[ ! -f pki/ca.crt ]]; then
+  ./easyrsa init-pki
+  EASYRSA_REQ_CN='${name}-vpn-ca' ./easyrsa build-ca nopass
+  ./easyrsa build-server-full server nopass
+fi
+./easyrsa gen-crl
+install -m 644 pki/ca.crt pki/issued/server.crt pki/crl.pem /etc/openvpn/server/
+install -m 600 pki/private/server.key /etc/openvpn/server/server.key
+if [[ ! -f /etc/openvpn/server/tls-crypt.key ]]; then
+  openvpn --genkey secret /etc/openvpn/server/tls-crypt.key
+fi
+cat > /etc/openvpn/server/server.conf <<'CONFIG'
+port 1194
+proto udp4
+dev tun0
+topology subnet
+server ${vpn_network} ${vpn_netmask}
+ca ca.crt
+cert server.crt
+key server.key
+dh none
+tls-crypt tls-crypt.key
+tls-version-min 1.2
+data-ciphers AES-256-GCM:CHACHA20-POLY1305
+auth SHA256
+verify-client-cert require
+remote-cert-tls client
+crl-verify crl.pem
+user nobody
+group nogroup
+persist-key
+persist-tun
+keepalive 10 120
+explicit-exit-notify 1
+verb 3
+push "dhcp-option DNS ${vpn_gateway}"
+%{ for route in routes ~}
+push "route ${route.network} ${route.netmask}"
+%{ endfor ~}
+CONFIG
+cat > /etc/dnsmasq.d/openvpn.conf <<'CONFIG'
+interface=tun0
+listen-address=${vpn_gateway}
+bind-dynamic
+no-resolv
+server=${dns_server}
+CONFIG
+cat > /etc/sysctl.d/99-openvpn.conf <<'CONFIG'
+net.ipv4.ip_forward=1
+CONFIG
+sysctl --system
+
+# SNAT only VPN-to-private traffic; never provide a general internet exit.
+iptables -N VPN-FORWARD 2>/dev/null || true
+iptables -F VPN-FORWARD
+iptables -C FORWARD -i tun0 -j VPN-FORWARD 2>/dev/null || iptables -I FORWARD 1 -i tun0 -j VPN-FORWARD
+iptables -C FORWARD -o tun0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -o tun0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+%{ for route in routes ~}
+iptables -A VPN-FORWARD -d ${route.cidr} -j ACCEPT
+iptables -t nat -C POSTROUTING -s ${vpn_cidr} -d ${route.cidr} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${vpn_cidr} -d ${route.cidr} -j MASQUERADE
+%{ endfor ~}
+iptables -A VPN-FORWARD -j DROP
+netfilter-persistent save
+
+cat > /usr/local/sbin/vpn-client <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+[[ $EUID == 0 ]] || { echo 'Run as root'; exit 1; }
+action="$${1:-}"
+client="$${2:-}"
+[[ "$client" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo 'Usage: vpn-client issue|revoke CLIENT_NAME'; exit 1; }
+cd /etc/openvpn/easy-rsa
+export EASYRSA_BATCH=1 EASYRSA_ALGO=ec EASYRSA_CURVE=prime256v1
+case "$action" in
+  issue)
+    # Each profile is a credential. Issue one per person and transfer securely.
+    ./easyrsa build-client-full "$client" nopass
+    profile="/root/vpn-clients/$client.ovpn"
+    {
+      printf '%s\n' 'client' 'dev tun' 'proto udp4' 'remote ${public_ip} 1194' 'resolv-retry infinite' 'nobind' 'persist-key' 'persist-tun' 'remote-cert-tls server' 'tls-version-min 1.2' 'data-ciphers AES-256-GCM:CHACHA20-POLY1305' 'auth SHA256' 'verb 3'
+      echo '<ca>'; cat pki/ca.crt; echo '</ca>'
+      echo '<cert>'; sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' "pki/issued/$client.crt"; echo '</cert>'
+      echo '<key>'; cat "pki/private/$client.key"; echo '</key>'
+      echo '<tls-crypt>'; cat /etc/openvpn/server/tls-crypt.key; echo '</tls-crypt>'
+    } > "$profile"
+    echo "Created $profile; transfer it securely to its owner."
+    ;;
+  revoke)
+    ./easyrsa revoke "$client"
+    ./easyrsa gen-crl
+    install -m 644 pki/crl.pem /etc/openvpn/server/crl.pem
+    # Disconnect existing sessions too, including the revoked client.
+    systemctl restart openvpn-server@server
+    ;;
+  *) echo 'Usage: vpn-client issue|revoke CLIENT_NAME'; exit 1 ;;
+esac
+SCRIPT
+chmod 700 /usr/local/sbin/vpn-client
+cat > /usr/local/sbin/vpn-refresh-crl <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+cd /etc/openvpn/easy-rsa
+EASYRSA_BATCH=1 EASYRSA_CRL_DAYS=180 ./easyrsa gen-crl
+install -m 644 pki/crl.pem /etc/openvpn/server/crl.pem
+SCRIPT
+chmod 700 /usr/local/sbin/vpn-refresh-crl
+cat > /etc/systemd/system/vpn-refresh-crl.service <<'UNIT'
+[Unit]
+Description=Refresh the OpenVPN certificate revocation list
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpn-refresh-crl
+UNIT
+cat > /etc/systemd/system/vpn-refresh-crl.timer <<'UNIT'
+[Unit]
+Description=Keep the OpenVPN revocation list valid
+[Timer]
+OnCalendar=daily
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now vpn-refresh-crl.timer
+systemctl enable --now openvpn-server@server
+systemctl restart dnsmasq

@@ -1,0 +1,77 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: private-application-services
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {home-run.io/role: application}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [services]
+  validations:
+    - expression: "object.spec.type == 'ClusterIP' && (!has(object.spec.externalIPs) || size(object.spec.externalIPs) == 0)"
+      message: Application services must be ClusterIP with no external IPs.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: private-application-services
+spec:
+  policyName: private-application-services
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: private-application-ingress
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {home-run.io/role: application}
+    resourceRules:
+      - apiGroups: [networking.k8s.io]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [ingresses]
+  validations:
+    - expression: "has(object.spec.ingressClassName) && object.spec.ingressClassName == 'private-services' && (!has(object.metadata.annotations) || !('kubernetes.io/ingress.class' in object.metadata.annotations) || object.metadata.annotations['kubernetes.io/ingress.class'] == 'private-services')"
+      message: Applications must route through the private-services ingress class.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: private-application-ingress
+spec:
+  policyName: private-application-ingress
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: no-application-gateways
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {home-run.io/role: application}
+    resourceRules:
+      - apiGroups: [gateway.networking.k8s.io]
+        apiVersions: [v1, v1beta1]
+        operations: [CREATE, UPDATE]
+        resources: [gateways]
+  validations:
+    - expression: "false"
+      message: Only the platform-managed edge namespace may own a Gateway.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: no-application-gateways
+spec:
+  policyName: no-application-gateways
+  validationActions: [Deny]

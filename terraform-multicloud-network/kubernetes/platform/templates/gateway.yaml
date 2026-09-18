@@ -1,0 +1,163 @@
+{{- if not (has .Values.cloud (list "aws" "gcp" "azure")) }}{{ fail "cloud must be aws, gcp, or azure" }}{{ end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gateway
+  namespace: edge
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: home-run-gateway-classes
+rules:
+  - apiGroups: [networking.k8s.io]
+    resources: [ingressclasses]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: home-run-gateway-classes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: home-run-gateway-classes
+subjects:
+  - kind: ServiceAccount
+    name: gateway
+    namespace: edge
+{{- range splitList "," (include "platform.namespaces" .) }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gateway-discovery
+  namespace: {{ . }}
+rules:
+  - apiGroups: [""]
+    resources: [services, endpoints, secrets]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses/status]
+    verbs: [update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gateway-discovery
+  namespace: {{ . }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gateway-discovery
+subjects:
+  - kind: ServiceAccount
+    name: gateway
+    namespace: edge
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: private-services
+spec:
+  controller: traefik.io/ingress-controller
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: edge
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels: {app: gateway}
+  template:
+    metadata:
+      labels: {app: gateway}
+      annotations:
+        linkerd.io/inject: enabled
+        config.linkerd.io/default-inbound-policy: all-unauthenticated
+    spec:
+      serviceAccountName: gateway
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: {type: RuntimeDefault}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app: gateway}
+      containers:
+        - name: gateway
+          image: {{ .Values.gatewayImage | quote }}
+          args:
+            - --entrypoints.web.address=:8000
+            - --ping=true
+            - --ping.entrypoint=web
+            - --api.dashboard=false
+            - --providers.kubernetesingress=true
+            - --providers.kubernetesingress.ingressclass=private-services
+            - --providers.kubernetesingress.nativelbbydefault=true
+            - --providers.kubernetesingress.namespaces={{ include "platform.namespaces" . }}
+          ports:
+            - {name: http, containerPort: 8000}
+          readinessProbe:
+            httpGet: {path: /ping, port: http}
+          livenessProbe:
+            httpGet: {path: /ping, port: http}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: edge
+spec:
+  type: ClusterIP
+  selector: {app: gateway}
+  ports:
+    - {name: http, port: 80, targetPort: http}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway
+  namespace: edge
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels: {app: gateway}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: load-balancer-to-gateway
+  namespace: edge
+spec:
+  podSelector:
+    matchLabels: {app: gateway}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock: {cidr: {{ required "vpcCidr is required" .Values.vpcCidr | quote }}}
+        {{- if eq .Values.cloud "gcp" }}
+        - ipBlock: {cidr: 35.191.0.0/16}
+        - ipBlock: {cidr: 130.211.0.0/22}
+        {{- end }}
+      ports:
+        - {protocol: TCP, port: 8000}

@@ -1,0 +1,22 @@
+{{- $namespaces := splitList "," (include "platform.namespaces" .) -}}
+{{- range .Values.routes }}
+{{- if not (has .namespace $namespaces) }}{{ fail "route namespace must belong to this environment" }}{{ end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .name }}
+  namespace: {{ .namespace }}
+spec:
+  ingressClassName: private-services
+  rules:
+    - host: {{ $.Values.host | quote }}
+      http:
+        paths:
+          - path: {{ .path | quote }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .service }}
+                port: {number: {{ .port }}}
+{{- end }}

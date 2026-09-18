@@ -1,0 +1,6 @@
+apiVersion: v2
+name: home-run-platform
+description: Private application namespaces and a meshed HTTPS entry point
+type: application
+version: 0.1.0
+kubeVersion: ">=1.30.0-0"

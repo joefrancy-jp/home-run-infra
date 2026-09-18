@@ -1,0 +1,13 @@
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+plan.txt
+ci.auto.tfvars.json
+gha-creds-*.json
+crash.log
+*.ovpn
+*.key
+*.pem
+platform.json

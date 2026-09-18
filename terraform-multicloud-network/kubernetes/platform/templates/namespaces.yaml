@@ -1,0 +1,31 @@
+{{- $namespaces := splitList "," (include "platform.namespaces" .) }}
+{{- range $namespaces }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ . }}
+  labels:
+    home-run.io/role: application
+  annotations:
+    linkerd.io/inject: enabled
+    config.linkerd.io/default-inbound-policy: all-authenticated
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: private-applications
+  namespace: {{ . }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: edge
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: linkerd
+{{- end }}

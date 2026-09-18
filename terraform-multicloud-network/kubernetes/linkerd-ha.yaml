@@ -1,0 +1,30 @@
+controllerReplicas: 3
+enablePodAntiAffinity: true
+enablePodDisruptionBudget: true
+highAvailability: true
+webhookFailurePolicy: Fail
+controller:
+  podDisruptionBudget:
+    maxUnavailable: 1
+deploymentStrategy:
+  rollingUpdate:
+    maxUnavailable: 1
+    maxSurge: 25%
+controllerResources: &controllerResources
+  cpu:
+    request: 100m
+  memory:
+    request: 50Mi
+    limit: 250Mi
+destinationResources: *controllerResources
+identityResources: *controllerResources
+heartbeatResources: *controllerResources
+proxyInjectorResources: *controllerResources
+spValidatorResources: *controllerResources
+proxy:
+  resources:
+    cpu:
+      request: 100m
+    memory:
+      request: 20Mi
+      limit: 250Mi

@@ -1,0 +1,13 @@
+# Replace these entries with your real ClusterIP services and ports.
+# Paths are forwarded unchanged; applications must serve the configured prefix.
+routes:
+  - name: orders
+    namespace: dev
+    service: orders
+    port: 8080
+    path: /dev/orders
+  - name: orders
+    namespace: qa
+    service: orders
+    port: 8080
+    path: /qa/orders

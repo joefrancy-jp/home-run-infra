@@ -1,0 +1,2 @@
+# Add routes for actual production ClusterIP Services. See ../../routes.example.yaml.
+routes: []

@@ -1,0 +1,13 @@
+cloud: ""
+environment: ""
+host: ""
+vpcCidr: ""
+tlsSecretName: gateway-tls
+gatewayImage: traefik:v3.7.13
+replicas: 3
+aws:
+  certificateArn: ""
+  securityGroupId: ""
+# Application deployments and ClusterIP Services are supplied by their own repos.
+# Each route requires namespace, name, service, port, and path.
+routes: []

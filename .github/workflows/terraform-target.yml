@@ -1,0 +1,194 @@
+name: Terraform target
+
+on:
+  workflow_call:
+    inputs:
+      cloud:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      apply:
+        required: true
+        type: boolean
+      destroy:
+        description: Create a destruction plan (manual UAT only)
+        default: false
+        type: boolean
+      ref:
+        description: Exact commit to plan and apply
+        required: true
+        type: string
+    secrets:
+      ENVIRONMENT_READ_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+# Keep a plan and its approval/apply together for each state file.
+concurrency:
+  group: terraform-network-${{ inputs.cloud }}-${{ inputs.environment }}-${{ inputs.apply && 'deploy' || format('plan-{0}', github.event.pull_request.number || github.run_id) }}
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: 'false'
+
+jobs:
+  approval-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate target and apply event
+        env:
+          CLOUD: ${{ inputs.cloud }}
+          TARGET_ENV: ${{ inputs.environment }}
+          APPLY: ${{ inputs.apply }}
+          MERGED: ${{ github.event.pull_request.merged }}
+          ACTION: ${{ github.event.action }}
+          DESTROY: ${{ inputs.destroy }}
+          OPERATION: ${{ github.event.inputs.operation }}
+        run: |
+          [[ "$CLOUD" =~ ^(aws|gcp|azure)$ ]] || exit 1
+          [[ "$TARGET_ENV" =~ ^(dev|uat|prod)$ ]] || exit 1
+          if [[ "$DESTROY" == true || "$TARGET_ENV" == uat && "$APPLY" == true ]]; then
+            test "$TARGET_ENV" = uat
+            test "$GITHUB_EVENT_NAME" = workflow_dispatch
+            [[ "$GITHUB_REF" =~ ^refs/heads/(main|master)$ ]] || exit 1
+            if [[ "$DESTROY" == true ]]; then
+              test "$OPERATION" = destroy
+            else
+              test "$OPERATION" = create
+            fi
+          fi
+          if [[ "$APPLY" == true ]]; then
+            if [[ "$TARGET_ENV" != uat ]]; then
+              test "$GITHUB_EVENT_NAME" = pull_request
+              test "$ACTION" = closed
+              test "$MERGED" = true
+            fi
+          fi
+      - name: Verify mandatory approval is configured
+        if: inputs.apply
+        uses: actions/github-script@v7
+        env:
+          APPLY_ENVIRONMENT: terraform-${{ inputs.cloud }}-${{ inputs.environment }}-apply
+        with:
+          github-token: ${{ secrets.ENVIRONMENT_READ_TOKEN }}
+          script: |
+            const { data: environment } = await github.rest.repos.getEnvironment({
+              ...context.repo,
+              environment_name: process.env.APPLY_ENVIRONMENT,
+            });
+            const review = environment.protection_rules?.find(r => r.type === 'required_reviewers');
+            if (!review?.reviewers?.length || !review.prevent_self_review ||
+                environment.can_admins_bypass !== false) {
+              core.setFailed('Apply requires reviewers, prevent self-review, and administrator bypass disabled. See .github/README.md.');
+            }
+
+  plan:
+    name: Plan ${{ inputs.cloud }} / ${{ inputs.environment }}
+    needs: approval-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: terraform-${{ inputs.cloud }}-${{ inputs.environment }}-plan
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: terraform-multicloud-network/environments/${{ inputs.environment }}/network/${{ inputs.cloud }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: ./.github/actions/terraform-setup
+        with:
+          cloud: ${{ inputs.cloud }}
+          environment: ${{ inputs.environment }}
+          configuration: ${{ toJSON(vars) }}
+      - run: terraform validate -no-color
+      - name: Test private cluster configuration with mock providers
+        if: inputs.environment == 'dev'
+        run: terraform test -no-color
+      - name: Save plan for review and apply
+        env:
+          TF_VAR_env: ${{ inputs.environment }}
+          DESTROY: ${{ inputs.destroy }}
+        run: |
+          args=()
+          if [[ "$DESTROY" == true ]]; then
+            args+=(-destroy)
+          fi
+          terraform plan -no-color -lock-timeout=5m -out=tfplan "${args[@]}"
+          terraform show -no-color tfplan > plan.txt
+          {
+            echo '### Terraform plan'
+            echo "Commit: $(git rev-parse HEAD)"
+            echo 'Review plan.txt in the plan artifact before approving apply.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan-${{ inputs.cloud }}-${{ inputs.environment }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            terraform-multicloud-network/environments/${{ inputs.environment }}/network/${{ inputs.cloud }}/tfplan
+            terraform-multicloud-network/environments/${{ inputs.environment }}/network/${{ inputs.cloud }}/plan.txt
+            terraform-multicloud-network/environments/${{ inputs.environment }}/network/${{ inputs.cloud }}/.terraform.lock.hcl
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
+
+  apply:
+    name: Approve apply ${{ inputs.cloud }} / ${{ inputs.environment }}
+    if: inputs.apply
+    needs: plan
+    runs-on: ${{ inputs.destroy && fromJSON('["self-hosted","linux","private-cluster"]') || fromJSON('["ubuntu-latest"]') }}
+    timeout-minutes: 60
+    # Required reviewers on this environment provide the actual approval gate.
+    environment: terraform-${{ inputs.cloud }}-${{ inputs.environment }}-apply
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan-${{ inputs.cloud }}-${{ inputs.environment }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: terraform-multicloud-network/environments/${{ inputs.environment }}/network/${{ inputs.cloud }}
+      - name: Reject a superseded deployment
+        uses: actions/github-script@v7
+        env:
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref || github.ref_name }}
+          PLANNED_COMMIT: ${{ inputs.ref }}
+        with:
+          script: |
+            const {data} = await github.rest.repos.getBranch({...context.repo, branch: process.env.BASE_BRANCH});
+            if (data.commit.sha !== process.env.PLANNED_COMMIT) {
+              core.setFailed('The target branch advanced. Start a new UAT run or merge a fresh reviewed infrastructure PR to plan the latest commit.');
+            }
+      - uses: ./.github/actions/terraform-setup
+        with:
+          cloud: ${{ inputs.cloud }}
+          environment: ${{ inputs.environment }}
+          configuration: ${{ toJSON(vars) }}
+          lockfile: readonly
+      - name: Apply the reviewed plan
+        if: '!inputs.destroy'
+        working-directory: terraform-multicloud-network/environments/${{ inputs.environment }}/network/${{ inputs.cloud }}
+        run: terraform apply -no-color -lock-timeout=5m tfplan
+      - name: Remove UAT add-ons before destroying the private infrastructure
+        if: inputs.destroy
+        working-directory: terraform-multicloud-network/environments/${{ inputs.environment }}/network/${{ inputs.cloud }}
+        run: |
+          terraform output -json > "$RUNNER_TEMP/outputs.json"
+          if jq -e 'has("platform")' "$RUNNER_TEMP/outputs.json" > /dev/null; then
+            jq '.platform.value' "$RUNNER_TEMP/outputs.json" > "$RUNNER_TEMP/platform.json"
+            bash "$GITHUB_WORKSPACE/terraform-multicloud-network/kubernetes/manage.sh" uninstall "$RUNNER_TEMP/platform.json"
+          fi
+          terraform apply -no-color -lock-timeout=5m tfplan

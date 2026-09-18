@@ -1,0 +1,2 @@
+# Add routes for actual Dev/QA ClusterIP Services. See ../../routes.example.yaml.
+routes: []

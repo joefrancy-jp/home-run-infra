@@ -1,0 +1,83 @@
+name: Private cluster add-ons
+run-name: Cluster add-ons | ${{ inputs.cloud }} | ${{ inputs.environment }}
+on:
+  workflow_dispatch:
+    inputs:
+      cloud:
+        type: choice
+        required: true
+        options: [aws, gcp, azure]
+      environment:
+        type: choice
+        required: true
+        options: [dev, uat, prod]
+permissions:
+  contents: read
+concurrency:
+  group: terraform-network-${{ inputs.cloud }}-${{ inputs.environment }}-deploy
+  cancel-in-progress: false
+jobs:
+  policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require main or master
+        run: '[[ "$GITHUB_REF" =~ ^refs/heads/(main|master)$ ]]'
+      - name: Require deployment reviewers
+        uses: actions/github-script@v7
+        env:
+          TARGET: terraform-${{ inputs.cloud }}-${{ inputs.environment }}-apply
+        with:
+          github-token: ${{ secrets.ENVIRONMENT_READ_TOKEN }}
+          script: |
+            const {data} = await github.rest.repos.getEnvironment({...context.repo, environment_name: process.env.TARGET});
+            const review = data.protection_rules?.find(rule => rule.type === 'required_reviewers');
+            if (!review?.reviewers?.length || !review.prevent_self_review || data.can_admins_bypass !== false) {
+              core.setFailed('Configure reviewers, prevent self-review, and disable administrator bypass.');
+            }
+  install:
+    needs: policy
+    runs-on: [self-hosted, linux, private-cluster]
+    timeout-minutes: 60
+    environment: terraform-${{ inputs.cloud }}-${{ inputs.environment }}-apply
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/terraform-setup
+        with:
+          cloud: ${{ inputs.cloud }}
+          environment: ${{ inputs.environment }}
+          configuration: ${{ toJSON(vars) }}
+          lockfile: readonly
+      - name: Install Linkerd and the cloud ingress integration
+        env:
+          CLOUD: ${{ inputs.cloud }}
+          TARGET_ENV: ${{ inputs.environment }}
+          INGRESS_HOST: ${{ vars.INGRESS_HOST }}
+          AWS_ACM_CERTIFICATE_ARN: ${{ vars.AWS_ACM_CERTIFICATE_ARN }}
+          TRUST: ${{ secrets.LINKERD_TRUST_ANCHORS_PEM }}
+          ISSUER_CERT: ${{ secrets.LINKERD_ISSUER_CERT_PEM }}
+          ISSUER_KEY: ${{ secrets.LINKERD_ISSUER_KEY_PEM }}
+          TLS_CERT: ${{ secrets.INGRESS_TLS_CERT_PEM }}
+          TLS_KEY: ${{ secrets.INGRESS_TLS_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          umask 077
+          printf '%s\n' "$TRUST" > "$work/ca.pem"
+          printf '%s\n' "$ISSUER_CERT" > "$work/issuer.pem"
+          printf '%s\n' "$ISSUER_KEY" > "$work/issuer.key"
+          printf '%s\n' "$TLS_CERT" > "$work/tls.pem"
+          printf '%s\n' "$TLS_KEY" > "$work/tls.key"
+          export LINKERD_TRUST_ANCHORS_FILE="$work/ca.pem"
+          export LINKERD_ISSUER_CERT_FILE="$work/issuer.pem"
+          export LINKERD_ISSUER_KEY_FILE="$work/issuer.key"
+          export INGRESS_TLS_CERT_FILE="$work/tls.pem"
+          export INGRESS_TLS_KEY_FILE="$work/tls.key"
+          terraform -chdir="terraform-multicloud-network/environments/$TARGET_ENV/network/$CLOUD" output -json platform > "$work/platform.json"
+          bash terraform-multicloud-network/kubernetes/manage.sh install "$work/platform.json" "terraform-multicloud-network/kubernetes/environments/$TARGET_ENV/routes.yaml"

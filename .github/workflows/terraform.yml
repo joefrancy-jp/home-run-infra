@@ -1,0 +1,96 @@
+name: Terraform plan and apply
+run-name: >-
+  Terraform | ${{ github.event.pull_request.number && format('PR #{0}', github.event.pull_request.number) || 'manual plan' }} | ${{ github.event.action || 'plan' }}
+
+on:
+  pull_request:
+    branches: [main, master]
+    types: [opened, synchronize, reopened, ready_for_review, closed]
+  workflow_dispatch:
+    inputs:
+      cloud:
+        description: Cloud to plan
+        required: true
+        type: choice
+        options: [aws, gcp, azure]
+      environment:
+        description: Environment to plan
+        required: true
+        type: choice
+        options: [dev, uat, prod]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  select:
+    if: github.event.action != 'closed' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.target.outputs.matrix }}
+      has-targets: ${{ steps.target.outputs.has-targets }}
+      apply: ${{ steps.target.outputs.apply }}
+      ref: ${{ steps.target.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Test path selection and approval rules
+        run: node --test .github/scripts/terraform-targets.test.cjs
+      - name: Select changed roots and check merged PR approval
+        id: target
+        uses: actions/github-script@v7
+        env:
+          ENABLED_CLOUDS: ${{ vars.TF_ENABLED_CLOUDS || '["aws","gcp"]' }}
+          MANUAL_CLOUD: ${{ inputs.cloud }}
+          MANUAL_ENVIRONMENT: ${{ inputs.environment }}
+        with:
+          script: |
+            const select = require('./.github/scripts/terraform-targets.cjs');
+            await select({github, context, core});
+
+  secrets:
+    needs: select
+    uses: ./.github/workflows/trufflehog.yml
+
+  terraform:
+    needs: [select, secrets]
+    if: needs.select.outputs.has-targets == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/terraform-target.yml
+    with:
+      cloud: ${{ matrix.cloud }}
+      environment: ${{ matrix.environment }}
+      apply: ${{ needs.select.outputs.apply == 'true' && matrix.environment != 'uat' }}
+      ref: ${{ needs.select.outputs.ref }}
+    secrets:
+      ENVIRONMENT_READ_TOKEN: ${{ secrets.ENVIRONMENT_READ_TOKEN }}
+
+  result:
+    name: Terraform checks
+    if: always() && (github.event.action != 'closed' || github.event.pull_request.merged == true)
+    needs: [select, secrets, terraform]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all selected targets to pass
+        env:
+          SELECT: ${{ needs.select.result }}
+          SECRETS: ${{ needs.secrets.result }}
+          TERRAFORM: ${{ needs.terraform.result }}
+          HAS_TARGETS: ${{ needs.select.outputs.has-targets }}
+        run: |
+          test "$SELECT" = success
+          test "$SECRETS" = success
+          if [[ "$HAS_TARGETS" == true ]]; then
+            test "$TERRAFORM" = success
+          else
+            test "$TERRAFORM" = skipped
+          fi

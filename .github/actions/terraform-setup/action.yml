@@ -1,0 +1,114 @@
+name: Terraform cloud setup
+description: Authenticate using OIDC and initialize the selected cloud state backend
+inputs:
+  cloud:
+    description: aws, gcp, or azure
+    required: true
+  environment:
+    description: dev (Dev/QA), uat (on-demand), or prod
+    required: true
+  configuration:
+    description: GitHub environment variables as JSON
+    required: true
+  lockfile:
+    description: Provider lockfile mode
+    default: update
+runs:
+  using: composite
+  steps:
+    - uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.10.5
+        terraform_wrapper: false
+    - name: Authenticate to AWS
+      if: inputs.cloud == 'aws'
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ fromJSON(inputs.configuration).AWS_ROLE_ARN }}
+        aws-region: ${{ fromJSON(inputs.configuration).AWS_REGION }}
+        allowed-account-ids: ${{ fromJSON(inputs.configuration).AWS_ACCOUNT_ID }}
+    - name: Authenticate to GCP
+      if: inputs.cloud == 'gcp'
+      uses: google-github-actions/auth@v3
+      with:
+        workload_identity_provider: ${{ fromJSON(inputs.configuration).GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ fromJSON(inputs.configuration).GCP_SERVICE_ACCOUNT }}
+        project_id: ${{ fromJSON(inputs.configuration).GCP_PROJECT_ID }}
+    - name: Authenticate to Azure
+      if: inputs.cloud == 'azure'
+      uses: azure/login@v2
+      with:
+        client-id: ${{ fromJSON(inputs.configuration).AZURE_CLIENT_ID }}
+        tenant-id: ${{ fromJSON(inputs.configuration).AZURE_TENANT_ID }}
+        subscription-id: ${{ fromJSON(inputs.configuration).AZURE_SUBSCRIPTION_ID }}
+    - name: Initialize selected cloud and report target
+      shell: bash
+      working-directory: terraform-multicloud-network/environments/${{ inputs.environment }}/network/${{ inputs.cloud }}
+      env:
+        CLOUD: ${{ inputs.cloud }}
+        TARGET_ENV: ${{ inputs.environment }}
+        LOCKFILE: ${{ inputs.lockfile }}
+        CONFIGURATION: ${{ inputs.configuration }}
+      run: |
+        set -euo pipefail
+        config() {
+          jq -er --arg key "$1" '.[$key] | select(type == "string" and length > 0)' <<< "$CONFIGURATION"
+        }
+        state="network/${TARGET_ENV}-home-run-${CLOUD}"
+        args=(-input=false -reconfigure "-lockfile=$LOCKFILE")
+        case "$CLOUD" in
+          aws)
+            region=$(config AWS_REGION)
+            account=$(config AWS_ACCOUNT_ID)
+            test "$(aws sts get-caller-identity --query Account --output text)" = "$account"
+            args+=("-backend-config=bucket=$(config TF_STATE_BUCKET)" "-backend-config=region=$region" "-backend-config=key=$state.tfstate")
+            jq -n --arg region "$region" '{region: $region}' > ci.auto.tfvars.json
+            target="AWS account $account; region $region"
+            ;;
+          gcp)
+            project=$(config GCP_PROJECT_ID)
+            region=$(config GCP_REGION)
+            args+=("-backend-config=bucket=$(config TF_STATE_BUCKET)" "-backend-config=prefix=$state")
+            jq -n --arg project "$project" --arg region "$region" '{project_id: $project, region: $region}' > ci.auto.tfvars.json
+            target="GCP project $project; region $region; identity $(config GCP_SERVICE_ACCOUNT)"
+            ;;
+          azure)
+            subscription=$(config AZURE_SUBSCRIPTION_ID)
+            location=$(config AZURE_LOCATION)
+            test "$(az account show --query id --output tsv)" = "$subscription"
+            args+=("-backend-config=resource_group_name=$(config TF_STATE_RESOURCE_GROUP)" "-backend-config=storage_account_name=$(config TF_STATE_STORAGE_ACCOUNT)" "-backend-config=container_name=$(config TF_STATE_CONTAINER)" "-backend-config=key=$state.tfstate" "-backend-config=use_azuread_auth=true" "-backend-config=use_oidc=true")
+            export ARM_USE_OIDC=true ARM_USE_AZUREAD=true
+            export ARM_CLIENT_ID ARM_TENANT_ID ARM_SUBSCRIPTION_ID
+            ARM_CLIENT_ID=$(config AZURE_CLIENT_ID)
+            ARM_TENANT_ID=$(config AZURE_TENANT_ID)
+            ARM_SUBSCRIPTION_ID=$subscription
+            {
+              echo "ARM_CLIENT_ID=$ARM_CLIENT_ID"
+              echo "ARM_TENANT_ID=$ARM_TENANT_ID"
+              echo "ARM_SUBSCRIPTION_ID=$ARM_SUBSCRIPTION_ID"
+              echo 'ARM_USE_OIDC=true'
+              echo 'ARM_USE_AZUREAD=true'
+            } >> "$GITHUB_ENV"
+            jq -n --arg subscription "$subscription" --arg location "$location" '{subscription_id: $subscription, location: $location}' > ci.auto.tfvars.json
+            target="Azure subscription $subscription; location $location"
+            ;;
+          *) echo "Unsupported cloud: $CLOUD" >&2; exit 1 ;;
+        esac
+        admins=$(config CLUSTER_ADMIN_IDENTITIES)
+        jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' <<< "$admins" > /dev/null
+        public_key=$(jq -r '.VPN_SSH_PUBLIC_KEY // ""' <<< "$CONFIGURATION")
+        if [[ "$CLOUD" != gcp ]]; then
+          test -n "$public_key"
+        fi
+        jq --argjson admins "$admins" --arg public_key "$public_key" \
+          '. + {cluster_admin_identities: $admins, vpn_ssh_public_key: $public_key}' \
+          ci.auto.tfvars.json > ci.auto.tfvars.json.tmp
+        mv ci.auto.tfvars.json.tmp ci.auto.tfvars.json
+        {
+          echo '### Deployment target'
+          echo "$target"
+          echo "Environment: $TARGET_ENV"
+          echo "State: $state"
+          echo 'Runner: GitHub-hosted ubuntu-latest'
+        } | tee -a "$GITHUB_STEP_SUMMARY"
+        terraform init "${args[@]}"

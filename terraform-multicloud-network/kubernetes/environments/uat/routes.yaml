@@ -1,0 +1,2 @@
+# Add routes for actual UAT ClusterIP Services. See ../../routes.example.yaml.
+routes: []
