@@ -4,106 +4,10 @@ data "google_compute_zones" "available" {
   status  = "UP"
 }
 resource "google_project_service" "required" {
-  for_each           = toset(["compute.googleapis.com", "container.googleapis.com", "iam.googleapis.com", "iap.googleapis.com", "oslogin.googleapis.com"])
+  for_each           = toset(["compute.googleapis.com", "iam.googleapis.com", "iap.googleapis.com", "oslogin.googleapis.com", "run.googleapis.com", "artifactregistry.googleapis.com"])
   project            = var.project_id
   service            = each.value
   disable_on_destroy = false
-}
-resource "google_service_account" "nodes" {
-  project      = var.project_id
-  account_id   = "${var.name}-nodes"
-  display_name = "Private GKE node identity"
-}
-resource "google_project_iam_member" "nodes" {
-  for_each = toset(["roles/container.defaultNodeServiceAccount", "roles/artifactregistry.reader"])
-  project  = var.project_id
-  role     = each.value
-  member   = "serviceAccount:${google_service_account.nodes.email}"
-}
-resource "google_project_iam_member" "admins" {
-  for_each = var.cluster_admin_members
-  project  = var.project_id
-  role     = "roles/container.admin"
-  member   = each.value
-}
-resource "google_container_cluster" "this" {
-  project                  = var.project_id
-  name                     = var.name
-  location                 = var.region
-  node_locations           = slice(data.google_compute_zones.available.names, 0, 3)
-  network                  = var.network_id
-  subnetwork               = var.private_subnet_ids[0]
-  remove_default_node_pool = true
-  initial_node_count       = 1
-  deletion_protection      = var.env == "prod"
-  min_master_version       = var.kubernetes_version
-  networking_mode          = "VPC_NATIVE"
-  datapath_provider        = "LEGACY_DATAPATH"
-  network_policy {
-    enabled  = true
-    provider = "CALICO"
-  }
-  addons_config {
-    network_policy_config { disabled = false }
-  }
-  release_channel { channel = "REGULAR" }
-  gateway_api_config { channel = "CHANNEL_STANDARD" }
-  workload_identity_config { workload_pool = "${var.project_id}.svc.id.goog" }
-  ip_allocation_policy {
-    cluster_secondary_range_name  = "pods"
-    services_secondary_range_name = "services"
-  }
-  private_cluster_config {
-    enable_private_nodes    = true
-    enable_private_endpoint = true
-    master_ipv4_cidr_block  = var.master_cidr
-    master_global_access_config { enabled = true }
-  }
-  master_authorized_networks_config {
-    private_endpoint_enforcement_enabled = true
-    gcp_public_cidrs_access_enabled      = false
-    cidr_blocks {
-      cidr_block   = var.vpc_cidr
-      display_name = "Private VPC including SNATed OpenVPN clients"
-    }
-  }
-  control_plane_endpoints_config {
-    dns_endpoint_config { allow_external_traffic = false }
-  }
-  master_auth {
-    client_certificate_config { issue_client_certificate = false }
-  }
-  enable_shielded_nodes = true
-  depends_on            = [google_project_service.required]
-}
-resource "google_container_node_pool" "this" {
-  project        = var.project_id
-  name           = "private"
-  cluster        = google_container_cluster.this.name
-  location       = var.region
-  node_locations = slice(data.google_compute_zones.available.names, 0, 3)
-  node_count     = 1
-  autoscaling {
-    min_node_count = 1
-    max_node_count = 3
-  }
-  management {
-    auto_repair  = true
-    auto_upgrade = true
-  }
-  node_config {
-    machine_type    = "e2-standard-2"
-    service_account = google_service_account.nodes.email
-    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
-    tags            = ["${var.name}-nodes"]
-    metadata        = { disable-legacy-endpoints = "true" }
-    workload_metadata_config { mode = "GKE_METADATA" }
-    shielded_instance_config {
-      enable_secure_boot          = true
-      enable_integrity_monitoring = true
-    }
-  }
-  depends_on = [google_project_iam_member.nodes]
 }
 
 resource "google_compute_firewall" "internal" {
@@ -111,7 +15,7 @@ resource "google_compute_firewall" "internal" {
   name          = "${var.name}-private-internal"
   network       = var.network_id
   direction     = "INGRESS"
-  source_ranges = [var.vpc_cidr, var.pod_cidr, var.master_cidr]
+  source_ranges = [var.vpc_cidr]
   target_tags   = ["${var.name}-nodes", "${var.name}-vpn"]
   allow { protocol = "all" }
 }
@@ -191,7 +95,7 @@ resource "google_compute_address" "vpn" {
   region  = var.region
 }
 locals {
-  routes = [var.vpc_cidr, var.pod_cidr, var.master_cidr]
+  routes = [var.vpc_cidr]
 }
 resource "google_compute_instance" "vpn" {
   project        = var.project_id
@@ -236,17 +140,30 @@ resource "google_compute_instance" "vpn" {
   })
   depends_on = [google_project_service.required]
 }
+resource "google_service_account" "cloudrun" {
+  project      = var.project_id
+  account_id   = "${var.name}-cloudrun"
+  display_name = "Cloud Run Service Account"
+}
 
-output "cluster_name" { value = google_container_cluster.this.name }
-output "cluster_endpoint" { value = google_container_cluster.this.private_cluster_config[0].private_endpoint }
+resource "google_cloud_run_v2_service" "app" {
+  name     = "${var.name}-app"
+  location = var.region
+
+  template {
+    service_account = google_service_account.cloudrun.email
+
+    containers {
+      image = "nginx:latest"
+    }
+  }
+}
+
 output "vpn_public_ip" { value = google_compute_address.vpn.address }
 output "vpn_instance_id" { value = google_compute_instance.vpn.name }
 output "vpn_zone" { value = google_compute_instance.vpn.zone }
 output "security" {
   value = {
-    private_api    = google_container_cluster.this.private_cluster_config[0].enable_private_endpoint
-    private_nodes  = google_container_cluster.this.private_cluster_config[0].enable_private_nodes
-    ha_workers     = length(google_container_node_pool.this.node_locations) == 3
     vpn_public_ssh = contains(google_compute_firewall.vpn_management.source_ranges, "0.0.0.0/0")
   }
 }
