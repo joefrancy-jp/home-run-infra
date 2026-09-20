@@ -14,13 +14,6 @@ variable "vpn_source_cidrs" {
   type    = list(string)
   default = ["0.0.0.0/0"]
 }
-variable "kubernetes_version" {
-  type    = string
-  default = null
-}
-variable "service_cidr" { type = string }
-variable "pod_cidr" { type = string }
 variable "project_id" { type = string }
 variable "region" { type = string }
-variable "master_cidr" { type = string }
 variable "cluster_admin_members" { type = set(string) }
